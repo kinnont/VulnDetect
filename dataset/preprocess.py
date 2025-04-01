@@ -6,7 +6,6 @@ train_index = set()
 valid_index = set()
 test_index = set()
 
-# 获取索引
 with open('train.txt') as f:
     for line in f:
         line = line.strip()
@@ -22,7 +21,6 @@ with open('test.txt') as f:
         line = line.strip()
         test_index.add(int(line))
 
-# 分割数据集
 with open('train.jsonl', 'w') as f:
     for idx, js in enumerate(js_all):
         if idx in train_index:
