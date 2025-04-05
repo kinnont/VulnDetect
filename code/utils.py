@@ -354,3 +354,14 @@ def index_to_code_token(index, code):
             s += code[i]
         s += code[end_point[0]][:end_point[1]]
     return s
+
+def node_drop(features, drop_prob=0.2):
+    features = features.copy()
+    drop_mask = np.random.rand(features.shape[0]) > drop_prob
+    features[~drop_mask] = 0
+    return features
+
+def edge_perturb(adj, perturb_prob=0.2):
+    adj = adj.copy()
+    mask = (np.random.rand(*adj.shape) > perturb_prob).astype(float)
+    return adj * mask

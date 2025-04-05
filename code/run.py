@@ -2,33 +2,26 @@ from __future__ import absolute_import, division, print_function
 
 import argparse
 import datetime
-import glob
-import logging
-import os
-import pickle
-import random
-import re
-import shutil
-
-import numpy as np
-import torch
-from torch.utils.data import DataLoader, Dataset, SequentialSampler, RandomSampler, TensorDataset
-from torch.utils.data.distributed import DistributedSampler
 import json
-from sklearn.metrics import precision_score, recall_score, f1_score, roc_auc_score, roc_curve
+import logging
 import multiprocessing
+import os
 
-from tqdm import tqdm, trange
+from sklearn.metrics import precision_score, recall_score, f1_score, roc_auc_score, roc_curve
+from torch.utils.data import DataLoader, Dataset, SequentialSampler, RandomSampler
+from torch.utils.data.distributed import DistributedSampler
+from tqdm import tqdm
+
 from model import *
 
 cpu_cont = multiprocessing.cpu_count()
-from transformers import (WEIGHTS_NAME, AdamW, get_linear_schedule_with_warmup,
+from transformers import (AdamW, get_linear_schedule_with_warmup,
                           BertConfig, BertForMaskedLM, BertTokenizer,
                           GPT2Config, GPT2LMHeadModel, GPT2Tokenizer,
                           OpenAIGPTConfig, OpenAIGPTLMHeadModel, OpenAIGPTTokenizer,
                           RobertaConfig, RobertaForSequenceClassification, RobertaTokenizer,
                           DistilBertConfig, DistilBertForMaskedLM, DistilBertTokenizer,
-                          LongformerConfig, LongformerForSequenceClassification, LongformerTokenizer)
+                          LongformerConfig, LongformerForSequenceClassification, LongformerTokenizer, RobertaModel)
 
 logger = logging.getLogger(__name__)
 
@@ -432,7 +425,7 @@ def test(args, model, tokenizer):
         "test_auc": round(auc, 4),
         "test_fpr_at_05": round(fpr_at_05, 4),
     }
-    with open(os.path.join(args.output_dir, datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + "_test_result.txt"), 'w') as f:
+    with open(os.path.join(args.output_dir, "result/" + datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + "_test_result.txt"), 'w') as f:
         for key, value in result.items():
             f.write(f"{key} = {value}\n")
     return result
@@ -560,6 +553,10 @@ def main():
     parser.add_argument("--input_droprate", default=0.2, type=float, help="输入特征丢弃率")
     parser.add_argument("--hidden_droprate", default=0.2, type=float, help="隐藏层丢弃率")
 
+    parser.add_argument("--use_contrastive", action='store_true', help="是否使用GRACE对比学习")
+    parser.add_argument("--contrastive_weight", type=float, default=0.1, help="对比损失的权重")
+    parser.add_argument("--temperature", type=float, default=0.5, help="对比损失的温度参数")
+
     args = parser.parse_args()
 
     # Setup CUDA, GPU & distributed training
@@ -631,13 +628,7 @@ def main():
         model = model_class(config)
 
     ## model
-    if args.model == "original":
-        model = Model(model, config, tokenizer, args)
-    elif args.model == "devign":
-        model = DevignModel(model, config, tokenizer, args)
-    else:  # GNNs
-        model = GNNReGVD(model, config, tokenizer, args)
-
+    model = GNNReGVD(model, config, tokenizer, args)
     model = model.double()  # 转换所有参数和缓冲区为double类型
 
     if args.local_rank == 0:

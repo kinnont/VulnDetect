@@ -27,17 +27,19 @@ python run.py \
   --train_data_file=$TRAIN_DATA_FILE \
   --eval_data_file=$EVAL_DATA_FILE \
   --test_data_file=$TEST_DATA_FILE \
-  --block_size=4096 \
+  --block_size=2048 \
   --train_batch_size=128 \
   --eval_batch_size=128 \
   --max_grad_norm=1.0 \
   --evaluate_during_training \
-  --gnn=GRAND \
+  --gnn=GraphSAGE \
   --learning_rate=5e-4 \
   --epoch=100 \
   --hidden_size=128 \
   --num_GNN_layers=2 \
   --format=uni \
   --window_size=5 \
-  --seed=234567 \
-  2>&1 | tee ~/training_log.txt
+  --seed=654321 \
+  --use_contrastive \
+  --contrastive_weight=0.1 \
+  --temperature=0.5 2>&1 | tee ~/training_log.txt
