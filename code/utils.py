@@ -1,16 +1,12 @@
-import numpy as np
 import pickle as pkl
+import re
+import sys
+import tokenize
+from io import StringIO
+
+import numpy as np
 import scipy.sparse as sp
 from scipy.sparse.linalg import eigsh
-import sys
-import random
-import re
-import re
-from io import StringIO
-import tokenize
-
-
-# import sparse
 
 
 def parse_index_file(filename):
@@ -355,11 +351,13 @@ def index_to_code_token(index, code):
         s += code[end_point[0]][:end_point[1]]
     return s
 
+
 def node_drop(features, drop_prob=0.2):
     features = features.copy()
     drop_mask = np.random.rand(features.shape[0]) > drop_prob
     features[~drop_mask] = 0
     return features
+
 
 def edge_perturb(adj, perturb_prob=0.2):
     adj = adj.copy()

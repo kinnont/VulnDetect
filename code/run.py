@@ -6,6 +6,7 @@ import json
 import logging
 import multiprocessing
 import os
+import random
 
 from sklearn.metrics import precision_score, recall_score, f1_score, roc_auc_score, roc_curve
 from torch.utils.data import DataLoader, Dataset, SequentialSampler, RandomSampler
@@ -21,7 +22,7 @@ from transformers import (AdamW, get_linear_schedule_with_warmup,
                           OpenAIGPTConfig, OpenAIGPTLMHeadModel, OpenAIGPTTokenizer,
                           RobertaConfig, RobertaForSequenceClassification, RobertaTokenizer,
                           DistilBertConfig, DistilBertForMaskedLM, DistilBertTokenizer,
-                          LongformerConfig, LongformerForSequenceClassification, LongformerTokenizer, RobertaModel)
+                          LongformerConfig, LongformerForSequenceClassification, LongformerTokenizer)
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +57,36 @@ class InputFeatures(object):  # 封装原始数据
         self.input_ids = input_ids
         self.idx = str(idx)
         self.label = label
+
+class EarlyStopping:
+    def __init__(self, patience=10, verbose=False, delta=0):
+        """
+        Args:
+        patience (int): 监控指标不再提升的轮数，超过该值停止训练
+        verbose (bool): 是否打印早停信息
+        delta (float): 性能提升的最小值，只有超过该值才认为是提升
+        """
+        self.patience = patience
+        self.verbose = verbose
+        self.delta = delta
+        self.counter = 0
+        self.best_score = None
+        self.early_stop = False
+        self.val_loss_min = np.Inf
+
+    def __call__(self, val_loss, model):
+        if self.best_score is None:
+            self.best_score = val_loss
+        elif val_loss < self.best_score - self.delta:
+            self.best_score = val_loss
+            self.counter = 0
+        else:
+            self.counter += 1
+            if self.counter >= self.patience:
+                self.early_stop = True
+                if self.verbose:
+                    print(f"Early stopping triggered after {self.patience} epochs of no improvement.")
+        return self.early_stop
 
 
 # 清理代码中的无关内容
@@ -205,6 +236,8 @@ def train(args, train_dataset, model, tokenizer):
     # model.resize_token_embeddings(len(tokenizer))
     model.zero_grad()
 
+    early_stopping = EarlyStopping(patience=10, verbose=True)
+
     for idx in range(args.start_epoch, int(args.num_train_epochs)):
         seed = idx * 100 + args.seed  # 增强随机性
         bar = tqdm(train_dataloader, total=len(train_dataloader), leave=True, unit="batch")
@@ -246,7 +279,9 @@ def train(args, train_dataset, model, tokenizer):
                 scheduler.step()
                 global_step += 1
                 output_flag = True
-                avg_loss = round(np.exp((tr_loss - logging_loss) / (global_step - tr_nb)), 4)
+                #avg_loss = round(np.exp((tr_loss - logging_loss) / (global_step - tr_nb)), 4)
+                avg_loss = round((tr_loss - logging_loss) / max((global_step - tr_nb), 1), 4)
+
                 if args.local_rank in [-1, 0] and args.logging_steps > 0 and global_step % args.logging_steps == 0:
                     logging_loss = tr_loss
                     tr_nb = global_step
@@ -292,6 +327,15 @@ def train(args, train_dataset, model, tokenizer):
 
         avg_loss = round(train_loss / tr_num, 5)
         logger.info("Epoch {} loss {}".format(idx + 1, avg_loss))
+
+        # 添加早停判断（每个 epoch 后）
+        if args.evaluate_during_training:
+            eval_results = evaluate(args, model, tokenizer)
+            val_loss = eval_results['eval_loss']
+
+            if early_stopping(val_loss, model):
+                logger.info("Early stopping triggered at epoch {}".format(idx + 1))
+                break
 
 
 def evaluate(args, model, tokenizer, eval_when_training=False):
@@ -425,7 +469,7 @@ def test(args, model, tokenizer):
         "test_auc": round(auc, 4),
         "test_fpr_at_05": round(fpr_at_05, 4),
     }
-    with open(os.path.join(args.output_dir, "result/" + datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + "_test_result.txt"), 'w') as f:
+    with open(os.path.join(args.output_dir, datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + "_test_result.txt"), 'w') as f:
         for key, value in result.items():
             f.write(f"{key} = {value}\n")
     return result
@@ -628,7 +672,11 @@ def main():
         model = model_class(config)
 
     ## model
-    model = GNNReGVD(model, config, tokenizer, args)
+    if args.model == "original":
+        model = Model(model, config, tokenizer, args)
+    else:  # GNNs
+        model = GNN(model, config, tokenizer, args)
+
     model = model.double()  # 转换所有参数和缓冲区为double类型
 
     if args.local_rank == 0:

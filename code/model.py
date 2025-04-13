@@ -1,19 +1,11 @@
-import torch
 import math
+
+import torch
 import torch.nn as nn
-from sympy.codegen import Print
-from torch.autograd import Variable
-import copy
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
-from torch.nn import CrossEntropyLoss, MSELoss
-from utils import preprocess_features, preprocess_adj
+
 from utils import *
-import ast
-import networkx as nx
-import numpy as np
-import scipy.sparse as sp
-from pycparser import c_parser, c_ast
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -23,6 +15,188 @@ att_op_dict = {
     'concat': 'concat'
 }
 
+# 带有残差连接的GGNN实现
+class ReGGNN(nn.Module):
+    def __init__(self, feature_dim_size, hidden_size, num_GNN_layers, dropout, act=nn.functional.relu,
+                 residual=True, att_op='mul', alpha_weight=1.0):
+        super(ReGGNN, self).__init__()
+        self.num_GNN_layers = num_GNN_layers
+        self.residual = residual
+        self.att_op = att_op
+        self.alpha_weight = alpha_weight
+        self.out_dim = hidden_size
+        if self.att_op == att_op_dict['concat']:
+            self.out_dim = hidden_size * 2
+
+        self.emb_encode = nn.Linear(feature_dim_size, hidden_size).double()
+        self.dropout_encode = nn.Dropout(dropout)
+        self.z0 = nn.Linear(hidden_size, hidden_size).double()
+        self.z1 = nn.Linear(hidden_size, hidden_size).double()
+        self.r0 = nn.Linear(hidden_size, hidden_size).double()
+        self.r1 = nn.Linear(hidden_size, hidden_size).double()
+        self.h0 = nn.Linear(hidden_size, hidden_size).double()
+        self.h1 = nn.Linear(hidden_size, hidden_size).double()
+        self.soft_att = nn.Linear(hidden_size, 1).double()
+        self.ln = nn.Linear(hidden_size, hidden_size).double()
+        self.act = act
+
+    def gatedGNN(self, x, adj):
+        a = torch.matmul(adj, x)
+        # update gate
+        z0 = self.z0(a.double())
+        z1 = self.z1(x.double())
+        z = torch.sigmoid(z0 + z1)
+        # reset gate
+        r = torch.sigmoid(self.r0(a.double()) + self.r1(x.double()))
+        # update embeddings
+        h = self.act(self.h0(a.double()) + self.h1(r.double() * x.double()))
+
+        return h * z + x * (1 - z)
+
+    def forward(self, inputs, adj, mask):
+        x = inputs
+        x = self.dropout_encode(x)
+        x = self.emb_encode(x.double())
+        x = x * mask
+        for idx_layer in range(self.num_GNN_layers):
+            if self.residual:
+                x = x + self.gatedGNN(x.double(),
+                                      adj.double()) * mask.double()  # add residual connection, can use a weighted sum
+            else:
+                x = self.gatedGNN(x.double(), adj.double()) * mask.double()
+        # soft attention
+        soft_att = torch.sigmoid(self.soft_att(x))
+        x = self.act(self.ln(x))
+        x = soft_att * x * mask
+        # sum/mean and max pooling
+
+        # sum and max pooling
+        if self.att_op == att_op_dict['sum']:
+            graph_embeddings = torch.sum(x, 1) + torch.amax(x, 1)
+        elif self.att_op == att_op_dict['concat']:
+            graph_embeddings = torch.cat((torch.sum(x, 1), torch.amax(x, 1)), 1)
+        else:
+            graph_embeddings = torch.sum(x, 1) * torch.amax(x, 1)
+
+        return graph_embeddings
+
+
+# 带有残差连接的GCN实现
+class ReGCN(nn.Module):
+    def __init__(self, feature_dim_size, hidden_size, num_GNN_layers, dropout, act=nn.functional.relu,
+                 residual=True, att_op="mul", alpha_weight=1.0):
+        super(ReGCN, self).__init__()
+        self.num_GNN_layers = num_GNN_layers
+        self.residual = residual
+        self.att_op = att_op
+        self.alpha_weight = alpha_weight
+        self.out_dim = hidden_size
+        if self.att_op == att_op_dict['concat']:
+            self.out_dim = hidden_size * 2
+
+        self.gnnlayers = torch.nn.ModuleList()
+        for layer in range(self.num_GNN_layers):
+            if layer == 0:
+                self.gnnlayers.append(GraphConvolution(feature_dim_size, hidden_size, dropout, act=act))
+            else:
+                self.gnnlayers.append(GraphConvolution(hidden_size, hidden_size, dropout, act=act))
+        self.soft_att = nn.Linear(hidden_size, 1).double()
+        self.ln = nn.Linear(hidden_size, hidden_size).double()
+        self.act = act
+
+    def forward(self, inputs, adj, mask):
+        x = inputs
+        for idx_layer in range(self.num_GNN_layers):
+            if idx_layer == 0:
+                x = self.gnnlayers[idx_layer](x, adj) * mask
+            else:
+                if self.residual:
+                    x = x + self.gnnlayers[idx_layer](x, adj) * mask  # Residual Connection, can use a weighted sum
+                else:
+                    x = self.gnnlayers[idx_layer](x, adj) * mask
+        # soft attention
+        soft_att = torch.sigmoid(self.soft_att(x.double()).double())
+        x = self.act(self.ln(x))
+        x = soft_att * x * mask
+        # sum and max pooling
+        if self.att_op == att_op_dict['sum']:
+            graph_embeddings = torch.sum(x, 1) + torch.amax(x, 1)
+        elif self.att_op == att_op_dict['concat']:
+            graph_embeddings = torch.cat((torch.sum(x, 1), torch.amax(x, 1)), 1)
+        else:
+            graph_embeddings = torch.sum(x, 1) * torch.amax(x, 1)
+
+        return graph_embeddings
+
+
+# 无残差连接的GGNN实现
+class GGGNN(nn.Module):
+    def __init__(self, feature_dim_size, hidden_size, num_GNN_layers, dropout, act=nn.functional.relu):
+        super(GGGNN, self).__init__()
+        self.num_GNN_layers = num_GNN_layers
+        self.emb_encode = nn.Linear(feature_dim_size, hidden_size).double()
+        self.dropout_encode = nn.Dropout(dropout)
+        self.z0 = nn.Linear(hidden_size, hidden_size).double()
+        self.z1 = nn.Linear(hidden_size, hidden_size).double()
+        self.r0 = nn.Linear(hidden_size, hidden_size).double()
+        self.r1 = nn.Linear(hidden_size, hidden_size).double()
+        self.h0 = nn.Linear(hidden_size, hidden_size).double()
+        self.h1 = nn.Linear(hidden_size, hidden_size).double()
+        self.soft_att = nn.Linear(hidden_size, 1).double()
+        self.ln = nn.Linear(hidden_size, hidden_size).double()
+        self.act = act
+
+    def gatedGNN(self, x, adj):
+        a = torch.matmul(adj, x)
+        # update gate
+        z0 = self.z0(a.double())
+        z1 = self.z1(x.double())
+        z = torch.sigmoid(z0 + z1)
+        # reset gate
+        r = torch.sigmoid(self.r0(a.double()) + self.r1(x.double()))
+        # update embeddings
+        h = self.act(self.h0(a.double()) + self.h1(r.double() * x.double()))
+
+        return h * z + x * (1 - z)
+
+    def forward(self, inputs, adj, mask):
+        x = inputs
+        x = self.dropout_encode(x)
+        x = self.emb_encode(x.double())
+        x = x * mask
+        for idx_layer in range(self.num_GNN_layers):
+            x = self.gatedGNN(x.double(), adj.double()) * mask.double()
+        return x
+
+
+
+# GraphConvolution实现
+class GraphConvolution(torch.nn.Module):
+    def __init__(self, in_features, out_features, dropout, act=torch.relu, bias=False):
+        super(GraphConvolution, self).__init__()
+        self.weight = Parameter(torch.FloatTensor(in_features, out_features))
+        if bias:
+            self.bias = Parameter(torch.FloatTensor(out_features))
+        else:
+            self.register_parameter('bias', None)
+        self.reset_parameters()
+
+        self.act = act
+        self.dropout = nn.Dropout(dropout)
+
+    def reset_parameters(self):
+        stdv = math.sqrt(6.0 / (self.weight.size(0) + self.weight.size(1)))
+        self.weight.data.uniform_(-stdv, stdv)
+        if self.bias is not None:
+            self.bias.data.uniform_(-stdv, stdv)
+
+    def forward(self, input, adj):
+        x = self.dropout(input)
+        support = torch.matmul(x.double(), self.weight.double())
+        output = torch.matmul(adj.double(), support.double())
+        if self.bias is not None:
+            output = output + self.bias
+        return self.act(output)
 
 # GraphSAGE实现
 class GraphSAGE(nn.Module):
@@ -74,6 +248,7 @@ class GraphSAGE(nn.Module):
                 h = F.dropout(h, self.dropout, training=self.training)
 
         return h
+
 
 
 weighted_graph = False
@@ -202,55 +377,51 @@ def build_graph_text(shuffle_doc_words_list, word_embeddings, window_size=3):
 
     return x_adj, x_feature
 
-# AST图构建函数
-def build_graph_ast_from_source(code_list, word_embeddings):
-    x_adj = []
-    x_feature = []
-    vocab_size = word_embeddings.shape[0]
-    parser = c_parser.CParser()
+class Model(nn.Module):
+    def __init__(self, encoder, config, tokenizer, args):
+        super(Model, self).__init__()
+        self.encoder = encoder
+        self.config = config
+        self.tokenizer = tokenizer
+        self.args = args
 
-    for code_str in code_list:
-        try:
-            # 清理代码（可选）
-            code_str = code_str.strip()
-            if not code_str.endswith('}'):
-                code_str += ' }'  # 处理不完整函数尾巴
+    def forward(self, input_ids=None, labels=None, seed=None):
+        if seed is not None:
+            torch.manual_seed(seed)
 
-            wrapped_code = f"void dummy() {code_str}"  # 包装为合法函数
-            ast_tree = parser.parse(wrapped_code)
-
-            node_list = []
-            edges = []
-
-            def add_nodes_edges(node, parent_id=None):
-                node_id = len(node_list)
-                node_list.append(node)
-                if parent_id is not None:
-                    edges.append((parent_id, node_id))
-                for _, child in node.children():
-                    add_nodes_edges(child, node_id)
-
-            add_nodes_edges(ast_tree)
-
-            N = len(node_list)
-            row, col = zip(*edges) if edges else ([], [])
-            adj = sp.csr_matrix((np.ones(len(row)), (row, col)), shape=(N, N))
-            x_adj.append(adj)
-
-            features = []
-            for node in node_list:
-                node_type = type(node).__name__
-                type_id = hash(node_type) % vocab_size
-                features.append(word_embeddings[type_id])
-            x_feature.append(np.array(features))
-
-        except Exception as e:
-            x_adj.append(sp.csr_matrix((1, 1)))
-            x_feature.append(np.zeros((1, word_embeddings.shape[1])))
-
-    return x_adj, x_feature
+        outputs = self.encoder(input_ids, attention_mask=input_ids.ne(1))[0]
+        logits = outputs
+        prob = F.sigmoid(logits)
+        if labels is not None:
+            labels = labels.float()
+            loss = torch.log(prob[:, 0] + 1e-10) * labels + torch.log((1 - prob)[:, 0] + 1e-10) * (1 - labels)
+            loss = -loss.mean()
+            return loss, prob
+        else:
+            return prob
 
 
+
+class PredictionClassification(nn.Module):
+    """Head for sentence-level classification tasks."""
+
+    def __init__(self, config, args, input_size=None):
+        super().__init__()
+        # self.dense = nn.Linear(args.hidden_size * 2, args.hidden_size)
+        if input_size is None:
+            input_size = args.hidden_size
+        self.dense = nn.Linear(input_size, args.hidden_size)
+        self.dropout = nn.Dropout(config.hidden_dropout_prob)
+        self.out_proj = nn.Linear(args.hidden_size, args.num_classes)
+
+    def forward(self, features):  #
+        x = features
+        x = self.dropout(x)
+        x = self.dense(x.double())
+        x = torch.tanh(x)
+        x = self.dropout(x)
+        x = self.out_proj(x)
+        return x
 
 def contrastive_loss(z1, z2, temperature=0.5):
     z1 = F.normalize(z1, dim=1)
@@ -276,31 +447,10 @@ def contrastive_loss(z1, z2, temperature=0.5):
     return loss
 
 
-class PredictionClassification(nn.Module):
-    """Head for sentence-level classification tasks."""
 
-    def __init__(self, config, args, input_size=None):
-        super().__init__()
-        # self.dense = nn.Linear(args.hidden_size * 2, args.hidden_size)
-        if input_size is None:
-            input_size = args.hidden_size
-        self.dense = nn.Linear(input_size, args.hidden_size)
-        self.dropout = nn.Dropout(config.hidden_dropout_prob)
-        self.out_proj = nn.Linear(args.hidden_size, args.num_classes)
-
-    def forward(self, features):  #
-        x = features
-        x = self.dropout(x)
-        x = self.dense(x.double())
-        x = torch.tanh(x)
-        x = self.dropout(x)
-        x = self.out_proj(x)
-        return x
-
-
-class GNNReGVD(nn.Module):
+class GNN(nn.Module):
     def __init__(self, encoder, config, tokenizer, args):
-        super(GNNReGVD, self).__init__()
+        super(GNN, self).__init__()
         self.encoder = encoder
         self.config = config
         self.tokenizer = tokenizer
@@ -314,22 +464,28 @@ class GNNReGVD(nn.Module):
         else:
             raise ValueError("Unsupported model type. Expected Roberta or Longformer.")
 
-        if args.gnn == "GraphSAGE":  # 添加 GraphSAGE 支持
+        self.tokenizer = tokenizer
+        if args.gnn == "ReGGNN":
+            self.gnn = ReGGNN(feature_dim_size=args.feature_dim_size,
+                              hidden_size=args.hidden_size,
+                              num_GNN_layers=args.num_GNN_layers,
+                              dropout=config.hidden_dropout_prob,
+                              residual=not args.remove_residual,
+                              att_op=args.att_op)
+        elif args.gnn == "GraphSAGE":  # 添加 GraphSAGE 支持
             self.gnn = GraphSAGE(feature_dim_size=args.feature_dim_size,
                                  hidden_size=args.hidden_size,
                                  num_layers=args.num_GNN_layers,
                                  dropout=config.hidden_dropout_prob,
                                  aggregator_type='mean',
                                  residual=not args.remove_residual)
-
         else:
-            self.gnn = GraphSAGE(feature_dim_size=args.feature_dim_size,
-                                 hidden_size=args.hidden_size,
-                                 num_layers=args.num_GNN_layers,
-                                 dropout=config.hidden_dropout_prob,
-                                 aggregator_type='mean',
-                                 residual=not args.remove_residual)
-
+            self.gnn = ReGCN(feature_dim_size=args.feature_dim_size,
+                             hidden_size=args.hidden_size,
+                             num_GNN_layers=args.num_GNN_layers,
+                             dropout=config.hidden_dropout_prob,
+                             residual=not args.remove_residual,
+                             att_op=args.att_op)
         gnn_out_dim = self.gnn.out_dim
         self.classifier = PredictionClassification(config, args, input_size=gnn_out_dim)
 
@@ -340,8 +496,6 @@ class GNNReGVD(nn.Module):
         if self.args.format == "uni":
             adj, x_feature = build_graph(input_ids.cpu().detach().numpy(), self.w_embeddings,
                                          window_size=self.args.window_size)
-        elif self.args.format == "ast":
-            adj, x_feature = build_graph_ast(input_ids.cpu().detach().numpy(), self.w_embeddings, self.tokenizer)
         else:
             adj, x_feature = build_graph_text(input_ids.cpu().detach().numpy(), self.w_embeddings,
                                               window_size=self.args.window_size)
@@ -379,7 +533,6 @@ class GNNReGVD(nn.Module):
             # graph_embeddings = torch.mean(outputs, dim=1)  # 均值池化，维度为 (batch_size, hidden_size)
 
             logits = self.classifier(graph_embeddings)  # 分类器输入维度为 (batch_size, hidden_size)
-
         else:
             logits = self.classifier(outputs)
 
@@ -388,8 +541,10 @@ class GNNReGVD(nn.Module):
             labels = labels.float()
             loss = torch.log(prob[:, 0] + 1e-10) * labels + torch.log((1 - prob)[:, 0] + 1e-10) * (1 - labels)
             loss = -loss.mean()
+
             if self.args.use_contrastive:
                 loss = loss + self.args.contrastive_weight * c_loss  # 加入对比损失
+
             return loss, prob
         else:
             return prob
